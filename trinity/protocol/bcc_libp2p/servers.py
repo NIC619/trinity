@@ -212,9 +212,7 @@ class BCCReceiveServer(BaseService):
         self.run_daemon_task(self._handle_head_slot_requests())
         self.run_daemon_task(self._handle_head_root_requests())
 
-        while not self.p2p_node.is_started:
-            await self.sleep(0.5)
-
+        await self.wait(self.p2p_node.event_is_started.wait())
         self.logger.info("BCCReceiveServer up")
 
         self.run_daemon_task(self._handle_beacon_attestation_loop())
