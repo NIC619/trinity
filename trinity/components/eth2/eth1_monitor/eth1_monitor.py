@@ -15,13 +15,11 @@ from typing import (
 )
 
 from async_service import Service
-from eth_typing import Address, BLSPubkey, BLSSignature, BlockNumber, Hash32
+from eth_typing import BLSPubkey, BLSSignature, BlockNumber, Hash32
 
-from eth_utils import encode_hex, event_abi_to_log_topic
 from lahja import EndpointAPI
 import trio
 from web3 import Web3
-from web3.utils.events import get_event_data
 
 from eth.abc import AtomicDatabaseAPI
 
@@ -36,6 +34,7 @@ from eth2.beacon.tools.builder.validator import (
 )
 
 from .db import BaseDepositDataDB, ListCachedDepositDataDB
+from .eth1_data_provider import BaseEth1DataProvider
 from .events import (
     GetDepositResponse,
     GetDepositRequest,
@@ -91,11 +90,8 @@ def _w3_get_block(w3: Web3, *args: Any, **kwargs: Any) -> Eth1Block:
 class Eth1Monitor(Service):
     logger = logging.getLogger('trinity.eth1_monitor')
 
-    _w3: Web3
+    _eth1_data_provider: BaseEth1DataProvider
 
-    _deposit_contract: "Web3.eth.contract"
-    _deposit_event_abi: Dict[str, Any]
-    _deposit_event_topic: str
     # Number of blocks we wait to consider a block is "confirmed". This is used to avoid
     # mainchain forks.
     # We always get a `block` and parse the logs from it, where
@@ -114,25 +110,14 @@ class Eth1Monitor(Service):
     def __init__(
         self,
         *,
-        w3: Web3,
-        deposit_contract_address: Address,
-        deposit_contract_abi: Dict[str, Any],
+        eth1_data_provider: BaseEth1DataProvider,
         num_blocks_confirmed: int,
         polling_period: float,
         start_block_number: BlockNumber,
         event_bus: EndpointAPI,
         base_db: AtomicDatabaseAPI,
     ) -> None:
-        self._w3 = w3
-        self._deposit_contract = self._w3.eth.contract(
-            address=deposit_contract_address, abi=deposit_contract_abi
-        )
-        self._deposit_event_abi = (
-            self._deposit_contract.events.DepositEvent._get_event_abi()
-        )
-        self._deposit_event_topic = encode_hex(
-            event_abi_to_log_topic(self._deposit_event_abi)
-        )
+        self._eth1_data_provider = eth1_data_provider
         self._num_blocks_confirmed = num_blocks_confirmed
         self._polling_period = polling_period
         self._event_bus = event_bus
@@ -285,7 +270,7 @@ class Eth1Monitor(Service):
         `latest_block.number - self._num_blocks_confirmed`.
         """
         while self.is_running:
-            block = _w3_get_block(self._w3, "latest")
+            block = self._eth1_data_provider.get_block("latest")
             target_block_number = BlockNumber(block.number - self._num_blocks_confirmed)
             from_block_number = self.highest_processed_block_number
             if target_block_number > from_block_number:
@@ -293,7 +278,7 @@ class Eth1Monitor(Service):
                 for block_number in range(
                     from_block_number + 1, target_block_number + 1
                 ):
-                    yield _w3_get_block(self._w3, block_number)
+                    yield self._eth1_data_provider.get_block(block_number)
             await trio.sleep(self._polling_period)
 
     def _handle_block_data(self, block: Eth1Block) -> None:
@@ -314,25 +299,9 @@ class Eth1Monitor(Service):
 
     def _get_logs_from_block(self, block_number: BlockNumber) -> Tuple[DepositLog, ...]:
         """
-        Get the logs inside the block with number `block_number`.
+        Get the parsed logs inside the block with number `block_number`.
         """
-        # NOTE: web3 v4 does not support `contract.events.Event.getLogs`.
-        # After upgrading to v5, we can change to use the function.
-        logs = self._w3.eth.getLogs(
-            {
-                "fromBlock": block_number,
-                "toBlock": block_number,
-                "address": self._deposit_contract.address,
-                "topics": [self._deposit_event_topic],
-            }
-        )
-        parsed_logs = tuple(
-            DepositLog.from_contract_log_dict(
-                get_event_data(self._deposit_event_abi, log)
-            )
-            for log in logs
-        )
-        return parsed_logs
+        return self._eth1_data_provider.get_logs(block_number)
 
     def _process_logs(
         self, logs: Sequence[DepositLog], block_number: BlockNumber
@@ -388,8 +357,8 @@ class Eth1Monitor(Service):
         Get the accumulated deposit count from deposit contract with `get_deposit_count`
         at block `block_number`.
         """
-        deposit_count_bytes = self._deposit_contract.functions.get_deposit_count().call(
-            block_identifier=block_number
+        deposit_count_bytes = self._eth1_data_provider.get_deposit_count(
+            block_identifier=block_number,
         )
         return int.from_bytes(deposit_count_bytes, "little")
 
@@ -398,6 +367,6 @@ class Eth1Monitor(Service):
         Get the deposit root from deposit contract with `get_deposit_root`
         at block `block_number`.
         """
-        return self._deposit_contract.functions.get_deposit_root().call(
-            block_identifier=block_number
+        return self._eth1_data_provider.get_deposit_root(
+            block_identifier=block_number,
         )
