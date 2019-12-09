@@ -5,8 +5,6 @@ from typing import (
     Any,
     AsyncGenerator,
     Callable,
-    Dict,
-    NamedTuple,
     Sequence,
     Tuple,
     Type,
@@ -15,7 +13,7 @@ from typing import (
 )
 
 from async_service import Service
-from eth_typing import BLSPubkey, BLSSignature, BlockNumber, Hash32
+from eth_typing import BlockNumber, Hash32
 
 from lahja import EndpointAPI
 import trio
@@ -24,7 +22,6 @@ from web3 import Web3
 from eth.abc import AtomicDatabaseAPI
 
 from eth2.beacon.typing import Timestamp
-from eth2.beacon.typing import Gwei
 from eth2.beacon.types.deposits import Deposit
 from eth2.beacon.types.deposit_data import DepositData
 from eth2.beacon.types.eth1_data import Eth1Data
@@ -34,7 +31,7 @@ from eth2.beacon.tools.builder.validator import (
 )
 
 from .db import BaseDepositDataDB, ListCachedDepositDataDB
-from .eth1_data_provider import BaseEth1DataProvider
+from .eth1_data_provider import BaseEth1DataProvider, DepositLog, Eth1Block
 from .events import (
     GetDepositResponse,
     GetDepositRequest,
@@ -49,33 +46,6 @@ from .exceptions import (
 
 
 TRequest = TypeVar("TRequest", bound=Union[GetDepositRequest, GetEth1DataRequest])
-
-
-class Eth1Block(NamedTuple):
-    block_hash: Hash32
-    number: BlockNumber
-    timestamp: Timestamp
-
-
-class DepositLog(NamedTuple):
-    block_hash: Hash32
-    pubkey: BLSPubkey
-    # NOTE: The following noqa is to avoid a bug in pycodestyle. We can remove it after upgrading
-    #   `flake8`. Ref: https://github.com/PyCQA/pycodestyle/issues/635#issuecomment-411916058
-    withdrawal_credentials: Hash32  # noqa: E701
-    amount: Gwei
-    signature: BLSSignature
-
-    @classmethod
-    def from_contract_log_dict(cls, log: Dict[Any, Any]) -> "DepositLog":
-        log_args = log["args"]
-        return cls(
-            block_hash=log["blockHash"],
-            pubkey=log_args["pubkey"],
-            withdrawal_credentials=log_args["withdrawal_credentials"],
-            amount=Gwei(int.from_bytes(log_args["amount"], "little")),
-            signature=log_args["signature"],
-        )
 
 
 def _w3_get_block(w3: Web3, *args: Any, **kwargs: Any) -> Eth1Block:
@@ -196,7 +166,7 @@ class Eth1Monitor(Service):
                 f"`distance`={distance}, ",
                 f"eth1_voting_period_start_block_number={eth1_voting_period_start_block_number}",
             )
-        block_hash = _w3_get_block(self._w3, target_block_number).block_hash
+        block_hash = self._eth1_data_provider.get_block(target_block_number).block_hash
         # `Eth1Data.deposit_count`: get the `deposit_count` corresponding to the block.
         accumulated_deposit_count = self._get_accumulated_deposit_count(
             target_block_number
@@ -269,7 +239,7 @@ class Eth1Monitor(Service):
         Keep polling latest blocks, and yield the blocks whose number is
         `latest_block.number - self._num_blocks_confirmed`.
         """
-        while self.is_running:
+        while True:
             block = self._eth1_data_provider.get_block("latest")
             target_block_number = BlockNumber(block.number - self._num_blocks_confirmed)
             from_block_number = self.highest_processed_block_number
@@ -278,7 +248,7 @@ class Eth1Monitor(Service):
                 for block_number in range(
                     from_block_number + 1, target_block_number + 1
                 ):
-                    yield self._eth1_data_provider.get_block(block_number)
+                    yield self._eth1_data_provider.get_block(BlockNumber(block_number))
             await trio.sleep(self._polling_period)
 
     def _handle_block_data(self, block: Eth1Block) -> None:
@@ -358,7 +328,7 @@ class Eth1Monitor(Service):
         at block `block_number`.
         """
         deposit_count_bytes = self._eth1_data_provider.get_deposit_count(
-            block_identifier=block_number,
+            block_number=block_number,
         )
         return int.from_bytes(deposit_count_bytes, "little")
 
@@ -368,5 +338,5 @@ class Eth1Monitor(Service):
         at block `block_number`.
         """
         return self._eth1_data_provider.get_deposit_root(
-            block_identifier=block_number,
+            block_number=block_number,
         )
